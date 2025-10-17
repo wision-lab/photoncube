@@ -12,10 +12,13 @@ use image::{ImageReader, Rgb};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use itertools::multizip;
 use memmap2::{Mmap, MmapMut};
-use ndarray::{prelude::*, Array, ArrayView3, Axis, Slice};
+use ndarray::{concatenate, prelude::*, Array, ArrayViewD, Axis, Slice};
 use ndarray_npy::{read_npy, write_zeroed_npy, ViewMutNpyExt, ViewNpyError, ViewNpyExt};
 use numpy::{PyArray2, PyArrayMethods, ToPyArray};
-use pyo3::{prelude::*, types::PyType};
+use pyo3::{
+    prelude::*,
+    types::{PyTuple, PyType},
+};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use tempfile::tempdir;
 
@@ -23,7 +26,7 @@ use crate::{
     ffmpeg::{ensure_ffmpeg, make_video, Preset},
     signals::DeferredSignal,
     transforms::{
-        annotate, apply_transforms, array2_to_grayimage, binary_avg_to_rgb, gray_to_rgbimage,
+        annotate, apply_transforms, array2_to_grayimage, array3_to_image, binary_avg_to_rgb,
         grayimage_to_array2, interpolate_where_mask, linearrgb_to_srgb, pack_single,
         process_colorspad, process_grayspad, unpack_single, Transform,
     },
@@ -59,7 +62,7 @@ pub struct PhotonCube {
 
     _storage: Mmap,
 }
-pub type PhotonCubeView<'a> = ArrayView3<'a, u8>;
+pub type PhotonCubeView<'a> = ArrayViewD<'a, u8>;
 
 pub trait VirtualExposure {
     /// Create parallel iterator over all virtual exposures (bitplane averages of depth `burst_size`)
@@ -68,7 +71,7 @@ pub trait VirtualExposure {
         burst_size: usize,
         step: usize,
         drop_last: bool,
-    ) -> impl IndexedParallelIterator<Item = Array2<f32>>;
+    ) -> impl IndexedParallelIterator<Item = ArrayD<f32>>;
 
     /// Create a sequential iterator over all virtual exposures (bitplane averages of depth `burst_size`)
     fn virtual_exposures(
@@ -76,7 +79,7 @@ pub trait VirtualExposure {
         burst_size: usize,
         step: usize,
         drop_last: bool,
-    ) -> impl Iterator<Item = Array2<f32>>;
+    ) -> impl Iterator<Item = ArrayD<f32>>;
 }
 
 impl VirtualExposure for PhotonCubeView<'_> {
@@ -85,7 +88,7 @@ impl VirtualExposure for PhotonCubeView<'_> {
         burst_size: usize,
         step: usize,
         drop_last: bool,
-    ) -> impl IndexedParallelIterator<Item = Array2<f32>> {
+    ) -> impl IndexedParallelIterator<Item = ArrayD<f32>> {
         let num_frames = if drop_last {
             self.len_of(Axis(0)) / burst_size
         } else {
@@ -97,7 +100,7 @@ impl VirtualExposure for PhotonCubeView<'_> {
             .into_par_iter()
             .step_by(step)
             .map(|group| {
-                let (num_frames, _, _) = group.dim();
+                let num_frames = group.len_of(Axis(0));
                 let mut frame = group
                     // Iterate over all bitplanes in group
                     .axis_iter(Axis(0))
@@ -118,7 +121,7 @@ impl VirtualExposure for PhotonCubeView<'_> {
         burst_size: usize,
         step: usize,
         drop_last: bool,
-    ) -> impl Iterator<Item = Array2<f32>> {
+    ) -> impl Iterator<Item = ArrayD<f32>> {
         let num_frames = if drop_last {
             self.len_of(Axis(0)) / burst_size
         } else {
@@ -128,7 +131,7 @@ impl VirtualExposure for PhotonCubeView<'_> {
         self.axis_chunks_iter(Axis(0), burst_size)
             .step_by(step)
             .map(|group| {
-                let (num_frames, _, _) = group.dim();
+                let num_frames = group.len_of(Axis(0));
                 let mut frame = group
                     // Iterate over all bitplanes in group
                     .axis_iter(Axis(0))
@@ -278,9 +281,9 @@ impl PhotonCube {
         }
     }
 
-    /// Access the underlying data as a ArrayView3.
-    pub fn view(&self) -> Result<PhotonCubeView, ViewNpyError> {
-        ArrayView3::<u8>::view_npy(&self._storage)
+    /// Access the underlying data as a ArrayViewD.
+    pub fn view(&self) -> Result<PhotonCubeView<'_>, ViewNpyError> {
+        ArrayViewD::<u8>::view_npy(&self._storage)
     }
 
     /// Equivalent to setting `cube.transforms` directly.
@@ -317,45 +320,68 @@ impl PhotonCube {
     }
 
     /// Return function to process a single virtual exposure, depends on any masks (cfa/inpaint).
+    /// TODO: Most of this logic is duplicated in process_cube at the bitplane level, if we can make
+    ///     this generic over f32 and u8 and pass in a dither arg, can we combine them?
     pub fn process_single(
         &self,
         invert_response: bool,
+        factor: f32,
         tonemap2srgb: bool,
         colorspad_fix: bool,
         grayspad_fix: bool,
-    ) -> Result<impl Fn(Array2<f32>) -> Result<Array2<f32>> + '_> {
+    ) -> Result<impl Fn(ArrayD<f32>) -> Result<ArrayD<f32>> + '_> {
         if colorspad_fix && grayspad_fix {
             return Err(anyhow!(
                 "Cannot use both `colorspad_fix` and `grayspad_fix`."
             ));
         };
-        Ok(move |mut frame| {
+        Ok(move |mut frame: ArrayD<f32>| {
+            // Apply any frame-level fixes
+            if colorspad_fix {
+                frame = process_colorspad(
+                    frame
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!"),
+                )
+                .into_dyn();
+            }
+            if grayspad_fix {
+                frame = process_grayspad(
+                    frame
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!"),
+                )
+                .into_dyn();
+            }
+
             // Invert SPAD response
             if invert_response {
-                frame = binary_avg_to_rgb(frame, 1.0, None);
+                frame = binary_avg_to_rgb(&frame.view(), factor, None).into_dimensionality()?;
             }
 
             // Apply sRGB tonemapping
             if tonemap2srgb {
-                frame = linearrgb_to_srgb(frame);
-            }
-
-            // Apply any frame-level fixes
-            if colorspad_fix {
-                frame = process_colorspad(frame);
-            }
-            if grayspad_fix {
-                frame = process_grayspad(frame);
+                frame = linearrgb_to_srgb(&frame.view());
             }
 
             // Demosaic frame by interpolating white pixels
             if let Some(mask) = &self.cfa_mask {
-                frame = interpolate_where_mask(&frame, mask, false)?;
+                frame =
+                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), false)?
+                        .into_dyn()
+                        .squeeze()
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!");
             }
 
             // Inpaint any hot/dead pixels
             if let Some(mask) = &self.inpaint_mask {
-                frame = interpolate_where_mask(&frame, mask, false)?;
+                frame =
+                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), false)?
+                        .into_dyn()
+                        .squeeze()
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!");
             }
             Ok(frame)
         })
@@ -390,11 +416,14 @@ impl PhotonCube {
 
         // Processing closure applied to every bitplane
         let process_bitplane = |src_frame| {
-            let mut frame = unpack_single::<u8>(&src_frame, 1).unwrap();
+            let mut frame = unpack_single::<u8>(&src_frame, 1)
+                .unwrap()
+                .into_dimensionality()
+                .expect("SPAD data should not have a channel dimension!");
 
             // Apply any frame-level fixes
             if colorspad_fix {
-                frame = process_colorspad(frame);
+                frame = process_colorspad(frame)
             }
             if grayspad_fix {
                 frame = process_grayspad(frame);
@@ -402,12 +431,24 @@ impl PhotonCube {
 
             // Demosaic frame by interpolating white pixels
             if let Some(mask) = &self.cfa_mask {
-                frame = interpolate_where_mask(&frame, mask, true).unwrap();
+                frame =
+                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), true)
+                        .unwrap()
+                        .into_dyn()
+                        .squeeze()
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!");
             }
 
             // Inpaint any hot/dead pixels
             if let Some(mask) = &self.inpaint_mask {
-                frame = interpolate_where_mask(&frame, mask, true).unwrap();
+                frame =
+                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), true)
+                        .unwrap()
+                        .into_dyn()
+                        .squeeze()
+                        .into_dimensionality()
+                        .expect("SPAD data should not have a channel dimension!");
             }
 
             // Convert to image, apply transforms and convert back
@@ -418,9 +459,15 @@ impl PhotonCube {
 
         // Create empty dst file
         let file = File::create(dst.as_ref())?;
-        let probe_bitplane = process_bitplane(slice.slice(s![0, .., ..]));
+        let slice = slice
+            .into_dimensionality::<Ix3>()
+            .expect("SPAD data should not have a channel dimension!");
+        let probe_bitplane = process_bitplane(slice.slice(s![0, .., ..]).into_dyn());
         let (full_h, full_w) = probe_bitplane.dim();
-        let (out_h, out_w) = pack_single(&probe_bitplane.view(), 1)?.dim();
+        let (out_h, out_w) = pack_single(&probe_bitplane.view().into_dyn(), 1)?
+            .into_dimensionality::<Ix2>()
+            .expect("SPAD data should not have a channel dimension!")
+            .dim();
         write_zeroed_npy::<u8, _>(&file, (slice.len_of(Axis(0)), out_h, out_w))
             .map_err(|e| anyhow!(e))?;
 
@@ -447,8 +494,8 @@ impl PhotonCube {
             .progress_with(pbar)
             .for_each(|(src_frame, mut dst_frame)| {
                 // Process, bitpack it and save
-                let frame = process_bitplane(src_frame);
-                dst_frame.assign(&pack_single(&frame.view(), 1).unwrap());
+                let frame = process_bitplane(src_frame.into_dyn());
+                dst_frame.assign(&pack_single(&frame.view().into_dyn(), 1).unwrap());
             });
 
         Ok((slice.len_of(Axis(0)), full_h, full_w))
@@ -458,7 +505,7 @@ impl PhotonCube {
     pub fn save_images<P: AsRef<Path>>(
         &self,
         img_dir: P,
-        process_fn: Option<impl Fn(Array2<f32>) -> Result<Array2<f32>> + Send + Sync>,
+        process_fn: Option<impl Fn(ArrayD<f32>) -> Result<ArrayD<f32>> + Send + Sync>,
         annotate_frames: bool,
         message: Option<&str>,
         step: usize,
@@ -502,12 +549,19 @@ impl PhotonCube {
                     }
 
                     // Convert to uint8 in [0, 255] range
-                    let frame = frame.mapv(|x| (x * 255.0) as u8);
+                    let mut frame = frame.mapv(|x| (x * 255.0) as u8);
+
+                    // Ensure frame is HWC with C==3
+                    if frame.ndim() == 2 {
+                        frame.insert_axis_inplace(Axis(2));
+                        frame = concatenate![Axis(2), frame, frame, frame]
+                            .as_standard_layout()
+                            .to_owned();
+                    }
 
                     // Convert to image and rotate/flip as needed
-                    let frame = array2_to_grayimage(frame.to_owned());
-                    let frame = apply_transforms(frame, &self.transforms[..]);
-                    let mut frame = gray_to_rgbimage(&frame);
+                    let frame = array3_to_image(frame.into_dimensionality()?);
+                    let mut frame = apply_transforms(frame, &self.transforms[..]);
 
                     if annotate_frames {
                         let start_idx = i * self.burst_size.unwrap() + (self.start as usize);
@@ -538,7 +592,7 @@ impl PhotonCube {
         output: P,
         fps: u64,
         img_dir: Option<P>,
-        process_fn: Option<impl Fn(Array2<f32>) -> Result<Array2<f32>> + Send + Sync>,
+        process_fn: Option<impl Fn(ArrayD<f32>) -> Result<ArrayD<f32>> + Send + Sync>,
         annotate_frames: bool,
         crf: Option<u32>,
         preset: Option<Preset>,
@@ -726,7 +780,7 @@ impl PhotonCube {
     /// Save all virtual exposures to a folder.
     #[pyo3(
         name = "save_images",
-        signature = (img_dir, invert_response=false, tonemap2srgb=false, colorspad_fix=false, grayspad_fix=false, annotate_frames=false, message=None, step=1)
+        signature = (img_dir, invert_response=false, factor=1.0, tonemap2srgb=false, colorspad_fix=false, grayspad_fix=false, annotate_frames=false, message=None, step=1)
     )]
     #[allow(clippy::too_many_arguments)]
     pub fn save_images_py(
@@ -734,6 +788,7 @@ impl PhotonCube {
         py: Python,
         img_dir: PathBuf,
         invert_response: bool,
+        factor: f32,
         tonemap2srgb: bool,
         colorspad_fix: bool,
         grayspad_fix: bool,
@@ -742,15 +797,20 @@ impl PhotonCube {
         step: usize,
     ) -> Result<isize> {
         let _defer = DeferredSignal::new(py, "SIGINT")?;
-        let process =
-            self.process_single(invert_response, tonemap2srgb, colorspad_fix, grayspad_fix)?;
+        let process = self.process_single(
+            invert_response,
+            factor,
+            tonemap2srgb,
+            colorspad_fix,
+            grayspad_fix,
+        )?;
         self.save_images(img_dir, Some(process), annotate_frames, message, step)
     }
 
     /// Save all virtual exposures as a video (and optionally images).
     #[pyo3(
         name = "save_video",
-        signature = (output, fps=24, img_dir=None, invert_response=false, tonemap2srgb=false, colorspad_fix=false, grayspad_fix=false, annotate_frames=false, crf=28, preset="ultrafast", message=None, step=1)
+        signature = (output, fps=24, img_dir=None, invert_response=false, factor=1.0, tonemap2srgb=false, colorspad_fix=false, grayspad_fix=false, annotate_frames=false, crf=28, preset="ultrafast", message=None, step=1)
     )]
     #[allow(clippy::too_many_arguments)]
     pub fn save_video_py(
@@ -760,6 +820,7 @@ impl PhotonCube {
         fps: Option<u64>,
         img_dir: Option<PathBuf>,
         invert_response: bool,
+        factor: f32,
         tonemap2srgb: bool,
         colorspad_fix: bool,
         grayspad_fix: bool,
@@ -770,8 +831,13 @@ impl PhotonCube {
         step: usize,
     ) -> Result<isize> {
         let _defer = DeferredSignal::new(py, "SIGINT")?;
-        let process =
-            self.process_single(invert_response, tonemap2srgb, colorspad_fix, grayspad_fix)?;
+        let process = self.process_single(
+            invert_response,
+            factor,
+            tonemap2srgb,
+            colorspad_fix,
+            grayspad_fix,
+        )?;
 
         self.save_video(
             output,
@@ -799,12 +865,17 @@ impl PhotonCube {
 
     /// Get shape of photoncube with possible bitpacking
     #[getter]
-    pub fn shape(&self) -> (usize, usize, usize) {
-        self.view().expect("Cannot load photoncube").dim()
+    pub fn shape<'py>(&'py self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let shape = self
+            .view()
+            .expect("Cannot load photoncube")
+            .shape()
+            .to_owned();
+        PyTuple::new(py, shape)
     }
 
     /// Access individual bitplanes. Only simple integer-indexing is permitted. For more complex slicing,
-    /// first get desired fraem then use numpy to slice, e.g: `cube[4][..., 100:200]`.
+    /// first get desired frame then use numpy to slice, e.g: `cube[4][..., 100:200]`.
     pub fn __getitem__<'py>(&'py self, py: Python<'py>, idx: isize) -> Result<Py<PyAny>> {
         let view = self.view()?;
         let idx = if idx < 0 {

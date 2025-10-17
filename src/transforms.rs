@@ -13,10 +13,14 @@ use imageproc::{
     drawing::{draw_text_mut, text_size},
     map::map_pixels,
 };
-use ndarray::{concatenate, s, Array, Array2, Array3, ArrayView2, ArrayView3, Axis, Slice};
+use ndarray::{
+    concatenate, s, Array, Array2, Array3, ArrayD, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn,
+    Slice,
+};
 use ndarray_stats::{interpolate::Linear, QuantileExt};
 use noisy_float::types::n64;
 use pyo3::prelude::*;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use strum_macros::EnumString;
 
 #[pyclass(eq, eq_int)]
@@ -41,45 +45,39 @@ impl Transform {
     }
 }
 
-pub fn unpack_single<T>(bitplane: &ArrayView2<'_, u8>, axis: usize) -> Result<Array2<T>>
+/// Expects Array of shape HW(C)
+/// Cannot unpack along channel dimension
+pub fn unpack_single<T>(bitplane: &ArrayViewD<'_, u8>, axis: usize) -> Result<ArrayD<T>>
 where
-    T: From<u8> + Copy + num_traits::Zero + 'static,
+    T: From<u8> + Copy + num_traits::Zero + Send + Sync + 'static,
 {
-    let (h_orig, w_orig) = bitplane.dim();
-    let h = if axis == 0 { h_orig * 8 } else { h_orig };
-    let w = if axis == 1 { w_orig * 8 } else { w_orig };
+    let mut new_dim: Vec<usize> = bitplane.shape().into();
+    new_dim[axis] = new_dim[axis] * 8;
 
     // Allocate full sized frame
-    let mut unpacked_bitplane = Array2::<T>::zeros((h, w));
+    let mut unpacked_bitplane = ArrayD::<T>::zeros(IxDyn(&new_dim));
 
     // Iterate through slices with stride 8 of the full array and fill it up
-    // Note: We reverse the shift to account for endianness
+    // Note: We reverse the shift to account for endianness    
     for shift in 0..8 {
         let ishift = 7 - shift;
         let mut slice =
             unpacked_bitplane.slice_axis_mut(Axis(axis), Slice::from(shift..).step_by(8));
-        let bit = (bitplane & (1 << ishift)) >> ishift;
+        let bit = (bitplane >> ishift) & 1;
         slice.assign(&bit.mapv(|i| T::from(i)));
     }
 
     Ok(unpacked_bitplane)
 }
 
-pub fn pack_single(bitplane: &ArrayView2<'_, u8>, axis: usize) -> Result<Array2<u8>> {
-    let (h_orig, w_orig) = bitplane.dim();
-    let h = if axis == 0 {
-        (h_orig as f32 / 8.0).ceil() as usize
-    } else {
-        h_orig
-    };
-    let w = if axis == 1 {
-        (w_orig as f32 / 8.0).ceil() as usize
-    } else {
-        w_orig
-    };
+/// Expects Array of shape HW(C)
+/// Cannot pack along channel dimension
+pub fn pack_single(bitplane: &ArrayViewD<'_, u8>, axis: usize) -> Result<ArrayD<u8>> {
+    let mut new_dim: Vec<usize> = bitplane.shape().into();
+    new_dim[axis] = (new_dim[axis] as f32 / 8.0).ceil() as usize;
 
     // Allocate packed frame
-    let mut packed_bitplane = Array2::<u8>::zeros((h, w));
+    let mut packed_bitplane = ArrayD::<u8>::zeros(IxDyn(&new_dim));
 
     // Iterate through slices with stride 8 of the full array and fill up packed frame
     // Note: We reverse the shift to account for endianness
@@ -87,7 +85,8 @@ pub fn pack_single(bitplane: &ArrayView2<'_, u8>, axis: usize) -> Result<Array2<
         let ishift = 7 - shift;
         let slice = bitplane.slice_axis(Axis(axis), Slice::from(shift..).step_by(8));
         let bit = slice.mapv(|v| (v & 1) << ishift);
-        let (h, w) = slice.dim();
+        let h = slice.len_of(Axis(0));
+        let w = slice.len_of(Axis(1));
         packed_bitplane.slice_mut(s![..h, ..w]).bitor_assign(&bit);
     }
 
@@ -116,7 +115,7 @@ where
 }
 
 // Alternative to `nshare::RefNdarray2` which returns HW array
-pub fn ref_grayimage_to_array2<T>(im: &ImageBuffer<Luma<T>, Vec<T>>) -> ArrayView2<T>
+pub fn ref_grayimage_to_array2<T>(im: &ImageBuffer<Luma<T>, Vec<T>>) -> ArrayView2<'_, T>
 where
     T: image::Primitive,
 {
@@ -157,7 +156,7 @@ where
 }
 
 // Alternative to `nshare::RefNdarray3` which returns HWC array
-pub fn ref_image_to_array3<P>(im: &ImageBuffer<P, Vec<P::Subpixel>>) -> ArrayView3<P::Subpixel>
+pub fn ref_image_to_array3<P>(im: &ImageBuffer<P, Vec<P::Subpixel>>) -> ArrayView3<'_, P::Subpixel>
 where
     P: image::Pixel,
 {
@@ -210,9 +209,9 @@ where
     frame
 }
 
-pub fn linearrgb_to_srgb(mut frame: Array2<f32>) -> Array2<f32> {
+pub fn linearrgb_to_srgb(frame: &ArrayViewD<f32>) -> ArrayD<f32> {
     // https://github.com/blender/blender/blob/master/source/blender/blenlib/intern/math_color.c
-    frame.par_mapv_inplace(|x| {
+    frame.mapv(|x| {
         if x < 0.0031308 {
             if x < 0.0 {
                 return 0.0;
@@ -221,22 +220,21 @@ pub fn linearrgb_to_srgb(mut frame: Array2<f32>) -> Array2<f32> {
             }
         }
         1.055 * x.powf(1.0 / 2.4) - 0.055
-    });
-    frame
+    })
 }
 
 pub fn binary_avg_to_rgb(
-    mut frame: Array2<f32>,
+    frame: &ArrayViewD<f32>,
     factor: f32,
     quantile: Option<f32>,
-) -> Array2<f32> {
+) -> ArrayD<f32> {
     // Invert the process by which binary frames are simulated. The result can be either
     // linear RGB values or sRGB values depending on how the binary frames were constructed.
     // Assuming each binary patch was created by a Bernoulli process with p=1-exp(-factor*rgb),
     // then the average of binary frames tends to p. We can therefore recover the original rgb
     // values as -log(1-bin)/factor.
 
-    frame.par_mapv_inplace(|v| -(1.0 - v).clamp(1e-6, 1.0).ln() / factor);
+    let mut frame = frame.mapv(|v| -(1.0 - v).clamp(1e-6, 1.0).ln() / factor);
 
     if let Some(quantile_val) = quantile {
         let val = Array::from_iter(frame.iter().cloned())
@@ -254,7 +252,7 @@ pub fn binary_avg_to_rgb(
 }
 
 // Note: This does not yet support full array, only TOP half.
-pub fn process_colorspad<T>(mut frame: Array2<T>) -> Array2<T>
+pub fn process_colorspad<T>(frame: Array2<T>) -> Array2<T>
 where
     T: Clone,
 {
@@ -264,6 +262,7 @@ where
     }
 
     // Crop dead regions around edges
+    let mut frame = frame.to_owned();
     let mut crop = frame.slice_mut(s![2.., ..496]);
 
     // Swap rows (Can we do this inplace?)
@@ -301,15 +300,17 @@ where
 
 // Note: The use of generics here is heavy handed, we only really want this function
 //       to work with T=u8 or maybe T=f32/i32. Is there a better way? I.e generic over primitives?
+// Supports HWC
 pub fn interpolate_where_mask<T>(
-    frame: &Array2<T>,
-    mask: &Array2<bool>,
+    frame: &ArrayView3<T>,
+    mask: &ArrayView2<bool>,
     dither: bool,
-) -> Result<Array2<T>>
+) -> Result<Array3<T>>
 where
     T: Into<f32> + Clamp<f32> + Copy + 'static,
 {
-    let (h, w) = frame.dim();
+    let h = frame.len_of(Axis(0));
+    let w = frame.len_of(Axis(1));
     let (mask_h, mask_w) = mask.dim();
 
     if (mask_h < h) || (mask_w < w) {
@@ -320,7 +321,7 @@ where
         ));
     }
 
-    Ok(Array2::from_shape_fn((h, w), |(i, j)| {
+    Ok(Array3::from_shape_fn(frame.dim(), |(i, j, k)| {
         if mask[(i, j)] {
             let mut counter: f32 = 0.0;
             let mut value: f32 = 0.0;
@@ -328,13 +329,13 @@ where
             for ki in [(i as isize) - 1, (i as isize) + 1] {
                 if (ki >= 0) && (ki < h as isize) && !mask[(ki as usize, j)] {
                     counter += 1.0;
-                    value += T::into(frame[(ki as usize, j)]);
+                    value += T::into(frame[(ki as usize, j, k)]);
                 }
             }
             for kj in [(j as isize) - 1, (j as isize) + 1] {
                 if (kj >= 0) && (kj < w as isize) && !mask[(i, kj as usize)] {
                     counter += 1.0;
-                    value += T::into(frame[(i, kj as usize)]);
+                    value += T::into(frame[(i, kj as usize, k)]);
                 }
             }
 
@@ -346,7 +347,7 @@ where
 
             T::clamp(value)
         } else {
-            frame[(i, j)]
+            frame[(i, j, k)]
         }
     }))
 }
@@ -355,23 +356,49 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{array, Array2};
+    use ndarray::{array, ArrayD};
 
     use crate::transforms::{pack_single, unpack_single};
 
     #[test]
     fn unpack_pack_axis0() {
-        let packed: Array2<u8> = array![[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        let packed: ArrayD<u8> = array![[1, 2, 3], [4, 5, 6], [7, 8, 9]].into_dyn();
         let unpacked = unpack_single(&packed.view(), 0).unwrap();
         let repacked = pack_single(&unpacked.view(), 0).unwrap();
-        assert_eq!(packed, repacked);
+        assert_eq!(packed.into_dyn(), repacked);
     }
 
     #[test]
     fn unpack_pack_axis1() {
-        let packed: Array2<u8> = array![[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        let packed: ArrayD<u8> = array![[1, 2, 3], [4, 5, 6], [7, 8, 9]].into_dyn();
         let unpacked = unpack_single(&packed.view(), 1).unwrap();
         let repacked = pack_single(&unpacked.view(), 1).unwrap();
         assert_eq!(packed, repacked);
+    }
+
+    #[test]
+    fn unpack_pack_axis0_channels() {
+        let packed: ArrayD<u8> = array![
+            [[1, 1], [2, 2], [3, 3]],
+            [[4, 4], [5, 5], [6, 6]],
+            [[7, 7], [8, 8], [9, 9]]
+        ]
+        .into_dyn();
+        let unpacked = unpack_single(&packed.view(), 0).unwrap();
+        let repacked = pack_single(&unpacked.view(), 0).unwrap();
+        assert_eq!(packed.into_dyn(), repacked);
+    }
+
+    #[test]
+    fn unpack_pack_axis1_channels() {
+        let packed: ArrayD<u8> = array![
+            [[1, 1], [2, 2], [3, 3]],
+            [[4, 4], [5, 5], [6, 6]],
+            [[7, 7], [8, 8], [9, 9]]
+        ]
+        .into_dyn();
+        let unpacked = unpack_single(&packed.view(), 1).unwrap();
+        let repacked = pack_single(&unpacked.view(), 1).unwrap();
+        assert_eq!(packed.into_dyn(), repacked);
     }
 }

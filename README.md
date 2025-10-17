@@ -126,6 +126,7 @@ PhotonCube.convert_to_npy(
 pc = PhotonCube.open("test.npy")
 
 # Get a frame
+# Note: Only simple integer indexing is allowed!
 frame = pc[10]
 
 # Load inpainting masks, both .png and .npy supported.

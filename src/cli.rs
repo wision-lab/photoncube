@@ -111,7 +111,7 @@ pub struct PreviewArgs {
     pub burst_size: usize,
 
     /// Only save every nth averaged frame
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1)]
     pub step: usize,
 
     /// Frame rate of resulting video
@@ -125,6 +125,10 @@ pub struct PreviewArgs {
     /// If enabled, invert the SPAD's response (Bernoulli process)
     #[arg(long, action)]
     pub invert_response: bool,
+
+    /// When inverting the SPAD's response, use this factor to modulate the scene response
+    #[arg(long, default_value_t = 1.0)]
+    pub factor: f32,
 
     /// When inverting the SPAD's response, use this quantile to normalize data
     #[arg(long, default_value = None)]
@@ -177,6 +181,7 @@ fn preview(args: PreviewArgs) -> Result<()> {
     let cube = load_cube(&args.common, Some(args.burst_size), args.quantile)?;
     let process = cube.process_single(
         args.invert_response,
+        args.factor,
         args.tonemap2srgb,
         args.common.fix.colorspad_fix,
         args.common.fix.grayspad_fix,
