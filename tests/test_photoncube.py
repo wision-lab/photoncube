@@ -5,9 +5,17 @@ import imageio.v3 as iio
 
 
 @pytest.fixture
-def photoncube(tmp_path):
+def grayscale_cube(tmp_path):
     path = tmp_path / "cube.npy"
-    cube = np.random.randint(low=0, high=255, size=(256, 64 // 8, 64), dtype=np.uint8)
+    cube = np.random.randint(low=0, high=255, size=(256, 1024, 1024 // 8), dtype=np.uint8)
+    np.save(path, cube)
+    return path, cube
+
+
+@pytest.fixture
+def color_cube(tmp_path):
+    path = tmp_path / "cube.npy"
+    cube = np.random.randint(low=0, high=255, size=(256, 1024, 1024  // 8, 3), dtype=np.uint8)
     np.save(path, cube)
     return path, cube
 
@@ -17,33 +25,67 @@ def test_import():
     from photoncube import PhotonCube, Transform
 
 
-def test_open(photoncube):
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_open(cube_fixture, request):
     from photoncube import PhotonCube
 
-    path, cube = photoncube
+    path, cube = request.getfixturevalue(cube_fixture)
     pc = PhotonCube.open(path)
     assert len(pc) == len(cube)
     assert pc.shape == cube.shape
 
 
-def test_save_images(photoncube, tmp_path):
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_save_images(cube_fixture, tmp_path, request):
     from photoncube import PhotonCube
 
-    path, cube = photoncube
-    pc = PhotonCube.open(str(path))
+    path, cube = request.getfixturevalue(cube_fixture)
+    pc = PhotonCube.open(path)
     pc.set_range(200, 205, 1)
     pc.save_images(tmp_path)
 
     for i, path in zip(range(200, 205), natsorted(tmp_path.glob("*.png"))):
         arr = iio.imread(path)
-        packed = np.packbits(arr, axis=1).mean(axis=2)
-        assert np.allclose(packed, cube[i])
+        packed = np.packbits(arr, axis=1)
+
+        if cube_fixture == "grayscale_cube":
+            assert np.allclose(packed.mean(axis=2), cube[i])
+        else:
+            assert np.allclose(packed, cube[i])
 
 
-def test_masks_readonly(photoncube):
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_slice(cube_fixture, request):
     from photoncube import PhotonCube
 
-    path, _ = photoncube
+    path, cube = request.getfixturevalue(cube_fixture)
+    pc = PhotonCube.open(path)
+
+    assert np.allclose(pc[0], np.unpackbits(cube[0], axis=1))
+    assert np.allclose(pc[-1], np.unpackbits(cube[-1], axis=1))
+
+
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_getitem_python(cube_fixture, request, benchmark):
+    path, _ = request.getfixturevalue(cube_fixture)
+    cube = np.load(path, mmap_mode="r")
+    benchmark(lambda: np.unpackbits(cube[0], axis=1))
+
+
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_getitem_rust(cube_fixture, request, benchmark):
+    from photoncube import PhotonCube
+
+    path, _ = request.getfixturevalue(cube_fixture)
+    pc = PhotonCube.open(path)
+    benchmark(lambda: pc[0])
+
+
+@pytest.mark.parametrize("cube_fixture", ("grayscale_cube", "color_cube"))
+def test_masks_readonly(cube_fixture, request):
+    from photoncube import PhotonCube
+
+    path, _ = request.getfixturevalue(cube_fixture)
     pc = PhotonCube.open(path)
 
     assert pc.inpaint_mask == None

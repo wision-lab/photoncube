@@ -27,18 +27,20 @@ dependencies = [
     "numpy"
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest",
-    "black",
-    "imageio"
-]
-
 [tool.maturin]
 features = ["pyo3/extension-module"]
 
 [tool.ruff]
 line-length = 121
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "black",
+    "imageio",
+    "natsort>=8.4.0",
+    "pytest-benchmark>=4.0.0",
+]
 
 [project.urls]
 "GitHub" = "https://github.com/WISION-Lab/photoncube"
@@ -46,3 +48,9 @@ line-length = 121
 [project.scripts]
 photoncube = "photoncube:cli_entrypoint"
 pcube = "photoncube:cli_entrypoint"
+
+[tool.uv]
+# Rebuild package when any rust files change
+cache-keys = [{file = "pyproject.toml"}, {file = "rust/Cargo.toml"}, {file = "**/*.rs"}]
+# Uncomment to build rust code in development mode
+# config-settings = { build-args = '--profile=dev' }
