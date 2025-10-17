@@ -14,11 +14,11 @@ use imageproc::{
     map::map_pixels,
 };
 use ndarray::{
-    concatenate, s, Array, Array2, Array3, ArrayD, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn,
-    Slice,
+    concatenate, s, Array, Array2, Array3, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, RawData, Slice
 };
 use ndarray_stats::{interpolate::Linear, QuantileExt};
 use noisy_float::types::n64;
+use numpy::{Ix2, Ix3};
 use pyo3::prelude::*;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use strum_macros::EnumString;
@@ -301,16 +301,17 @@ where
 // Note: The use of generics here is heavy handed, we only really want this function
 //       to work with T=u8 or maybe T=f32/i32. Is there a better way? I.e generic over primitives?
 // Supports HWC
-pub fn interpolate_where_mask<T>(
-    frame: &ArrayView3<T>,
-    mask: &ArrayView2<bool>,
+pub fn interpolate_where_mask<S1, S2, T>(
+    frame: &ArrayBase<S1, Ix3>,
+    mask: &ArrayBase<S2, Ix2>,
     dither: bool,
 ) -> Result<Array3<T>>
 where
+    S1: RawData<Elem = T> + ndarray::Data,
+    S2: RawData<Elem = bool> + ndarray::Data,
     T: Into<f32> + Clamp<f32> + Copy + 'static,
 {
-    let h = frame.len_of(Axis(0));
-    let w = frame.len_of(Axis(1));
+    let (h, w, c) = frame.dim();
     let (mask_h, mask_w) = mask.dim();
 
     if (mask_h < h) || (mask_w < w) {
@@ -321,7 +322,9 @@ where
         ));
     }
 
-    Ok(Array3::from_shape_fn(frame.dim(), |(i, j, k)| {
+    // Note: We iterate over CWH and reverse axes to HWC instead of directly creating 
+    //       a HWC array as this greatly improved cache locality and has a ~5x speedup!
+    Ok(Array3::from_shape_fn((c, w, h), |(k, j, i)| {
         if mask[(i, j)] {
             let mut counter: f32 = 0.0;
             let mut value: f32 = 0.0;
@@ -349,7 +352,7 @@ where
         } else {
             frame[(i, j, k)]
         }
-    }))
+    }).reversed_axes())
 }
 
 // ------------------------------------------------------------------------------
