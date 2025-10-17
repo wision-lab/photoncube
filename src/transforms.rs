@@ -14,13 +14,13 @@ use imageproc::{
     map::map_pixels,
 };
 use ndarray::{
-    concatenate, s, Array, Array2, Array3, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, RawData, Slice
+    concatenate, s, Array, Array2, Array3, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD,
+    Axis, IxDyn, RawData, Slice,
 };
 use ndarray_stats::{interpolate::Linear, QuantileExt};
 use noisy_float::types::n64;
 use numpy::{Ix2, Ix3};
 use pyo3::prelude::*;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use strum_macros::EnumString;
 
 #[pyclass(eq, eq_int)]
@@ -52,13 +52,13 @@ where
     T: From<u8> + Copy + num_traits::Zero + Send + Sync + 'static,
 {
     let mut new_dim: Vec<usize> = bitplane.shape().into();
-    new_dim[axis] = new_dim[axis] * 8;
+    new_dim[axis] *= 8;
 
     // Allocate full sized frame
     let mut unpacked_bitplane = ArrayD::<T>::zeros(IxDyn(&new_dim));
 
     // Iterate through slices with stride 8 of the full array and fill it up
-    // Note: We reverse the shift to account for endianness    
+    // Note: We reverse the shift to account for endianness
     for shift in 0..8 {
         let ishift = 7 - shift;
         let mut slice =
@@ -322,7 +322,7 @@ where
         ));
     }
 
-    // Note: We iterate over CWH and reverse axes to HWC instead of directly creating 
+    // Note: We iterate over CWH and reverse axes to HWC instead of directly creating
     //       a HWC array as this greatly improved cache locality and has a ~5x speedup!
     Ok(Array3::from_shape_fn((c, w, h), |(k, j, i)| {
         if mask[(i, j)] {
@@ -352,7 +352,8 @@ where
         } else {
             frame[(i, j, k)]
         }
-    }).reversed_axes())
+    })
+    .reversed_axes())
 }
 
 // ------------------------------------------------------------------------------
