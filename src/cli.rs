@@ -177,14 +177,17 @@ fn load_cube(
 }
 
 fn preview(args: PreviewArgs) -> Result<()> {
-    // Load all the neccesary files
+    // Load all the necessary files
     let cube = load_cube(&args.common, Some(args.burst_size), args.quantile)?;
-    let process = cube.process_single(
+    let process = cube.process_frame(
         args.invert_response,
         args.factor,
         args.tonemap2srgb,
         args.common.fix.colorspad_fix,
         args.common.fix.grayspad_fix,
+        &cube.cfa_mask,
+        &cube.inpaint_mask,
+        false,
     )?;
 
     // Generate preview

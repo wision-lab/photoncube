@@ -9,11 +9,13 @@ use std::{
 
 use anyhow::{anyhow, Error, Result};
 use image::{ImageReader, Rgb};
+use imageproc::definitions::Clamp;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use itertools::multizip;
 use memmap2::{Mmap, MmapMut};
 use ndarray::{concatenate, prelude::*, Array, ArrayViewD, Axis, Slice};
 use ndarray_npy::{read_npy, write_zeroed_npy, ViewMutNpyExt, ViewNpyError, ViewNpyExt};
+use num_traits::Zero;
 use numpy::{PyArray2, PyArrayMethods, ToPyArray};
 use pyo3::{
     prelude::*,
@@ -319,29 +321,42 @@ impl PhotonCube {
         }
     }
 
-    /// Return function to process a single virtual exposure, depends on any masks (cfa/inpaint).
-    /// TODO: Most of this logic is duplicated in process_cube at the bitplane level, if we can make
-    ///     this generic over f32 and u8 and pass in a dither arg, can we combine them?
-    pub fn process_single(
-        &self,
+    /// Return function to process a single frame.
+    /// If any masks (cfa/inpaint) are loaded these will be used.
+    /// This can be used with single bitplanes (use `dither=true`)
+    /// or virtual exposures alike.
+    ///
+    /// The hardware specific fixes (eg `colorspad_fix`) cannot be used
+    /// when the frame has a channel dimension, and only one fix can be
+    /// applied at any time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_frame<'a, T>(
+        &'a self,
         invert_response: bool,
         factor: f32,
         tonemap2srgb: bool,
         colorspad_fix: bool,
         grayspad_fix: bool,
-    ) -> Result<impl Fn(ArrayD<f32>) -> Result<ArrayD<f32>> + '_> {
+        cfa_mask: &'a Option<Array2<bool>>,
+        inpaint_mask: &'a Option<Array2<bool>>,
+        dither: bool,
+    ) -> Result<impl Fn(ArrayD<T>) -> Result<ArrayD<T>> + 'a>
+    where
+        T: Into<f32> + Clamp<f32> + Zero + Copy,
+    {
         if colorspad_fix && grayspad_fix {
             return Err(anyhow!(
                 "Cannot use both `colorspad_fix` and `grayspad_fix`."
             ));
         };
-        Ok(move |mut frame: ArrayD<f32>| {
+
+        Ok(move |mut frame: ArrayD<T>| {
             // Apply any frame-level fixes
             if colorspad_fix {
                 frame = process_colorspad(
                     frame
                         .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!"),
+                        .expect("RAW SPAD data should not have a channel dimension!"),
                 )
                 .into_dyn();
             }
@@ -349,14 +364,14 @@ impl PhotonCube {
                 frame = process_grayspad(
                     frame
                         .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!"),
+                        .expect("RAW SPAD data should not have a channel dimension!"),
                 )
                 .into_dyn();
             }
 
             // Invert SPAD response
             if invert_response {
-                frame = binary_avg_to_rgb(&frame.view(), factor, None).into_dimensionality()?;
+                frame = binary_avg_to_rgb(&frame.view(), factor, None);
             }
 
             // Apply sRGB tonemapping
@@ -365,23 +380,13 @@ impl PhotonCube {
             }
 
             // Demosaic frame by interpolating white pixels
-            if let Some(mask) = &self.cfa_mask {
-                frame =
-                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), false)?
-                        .into_dyn()
-                        .squeeze()
-                        .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!");
+            if let Some(mask) = &cfa_mask {
+                frame = interpolate_where_mask(&frame, mask, dither)?;
             }
 
             // Inpaint any hot/dead pixels
-            if let Some(mask) = &self.inpaint_mask {
-                frame =
-                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), false)?
-                        .into_dyn()
-                        .squeeze()
-                        .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!");
+            if let Some(mask) = &inpaint_mask {
+                frame = interpolate_where_mask(&frame, mask, dither)?;
             }
             Ok(frame)
         })
@@ -415,44 +420,22 @@ impl PhotonCube {
         let slice = view.slice_axis(Axis(0), Slice::new(self.start, self.end, 1));
 
         // Processing closure applied to every bitplane
+        let process_single = self.process_frame(
+            false,
+            1.0,
+            false,
+            colorspad_fix,
+            grayspad_fix,
+            &self.cfa_mask,
+            &self.inpaint_mask,
+            true,
+        )?;
         let process_bitplane = |src_frame| {
-            let mut frame = unpack_single::<u8>(&src_frame, 1)
-                .unwrap()
-                .into_dimensionality()
-                .expect("SPAD data should not have a channel dimension!");
-
-            // Apply any frame-level fixes
-            if colorspad_fix {
-                frame = process_colorspad(frame)
-            }
-            if grayspad_fix {
-                frame = process_grayspad(frame);
-            }
-
-            // Demosaic frame by interpolating white pixels
-            if let Some(mask) = &self.cfa_mask {
-                frame =
-                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), true)
-                        .unwrap()
-                        .into_dyn()
-                        .squeeze()
-                        .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!");
-            }
-
-            // Inpaint any hot/dead pixels
-            if let Some(mask) = &self.inpaint_mask {
-                frame =
-                    interpolate_where_mask(&frame.slice(s![.., .., NewAxis]), &mask.view(), true)
-                        .unwrap()
-                        .into_dyn()
-                        .squeeze()
-                        .into_dimensionality()
-                        .expect("SPAD data should not have a channel dimension!");
-            }
+            let mut frame = unpack_single::<u8>(&src_frame, 1).unwrap();
+            frame = process_single(frame).unwrap();
 
             // Convert to image, apply transforms and convert back
-            let frame = array2_to_grayimage(frame);
+            let frame = array2_to_grayimage(frame.into_dimensionality().unwrap());
             let frame = apply_transforms(frame, &self.transforms[..]);
             grayimage_to_array2(frame)
         };
@@ -461,12 +444,12 @@ impl PhotonCube {
         let file = File::create(dst.as_ref())?;
         let slice = slice
             .into_dimensionality::<Ix3>()
-            .expect("SPAD data should not have a channel dimension!");
+            .expect("RAW SPAD data should not have a channel dimension!");
         let probe_bitplane = process_bitplane(slice.slice(s![0, .., ..]).into_dyn());
         let (full_h, full_w) = probe_bitplane.dim();
         let (out_h, out_w) = pack_single(&probe_bitplane.view().into_dyn(), 1)?
             .into_dimensionality::<Ix2>()
-            .expect("SPAD data should not have a channel dimension!")
+            .expect("RAW SPAD data should not have a channel dimension!")
             .dim();
         write_zeroed_npy::<u8, _>(&file, (slice.len_of(Axis(0)), out_h, out_w))
             .map_err(|e| anyhow!(e))?;
@@ -797,12 +780,15 @@ impl PhotonCube {
         step: usize,
     ) -> Result<isize> {
         let _defer = DeferredSignal::new(py, "SIGINT")?;
-        let process = self.process_single(
+        let process = self.process_frame(
             invert_response,
             factor,
             tonemap2srgb,
             colorspad_fix,
             grayspad_fix,
+            &self.cfa_mask,
+            &self.inpaint_mask,
+            false,
         )?;
         self.save_images(img_dir, Some(process), annotate_frames, message, step)
     }
@@ -831,12 +817,15 @@ impl PhotonCube {
         step: usize,
     ) -> Result<isize> {
         let _defer = DeferredSignal::new(py, "SIGINT")?;
-        let process = self.process_single(
+        let process = self.process_frame(
             invert_response,
             factor,
             tonemap2srgb,
             colorspad_fix,
             grayspad_fix,
+            &self.cfa_mask,
+            &self.inpaint_mask,
+            false,
         )?;
 
         self.save_video(

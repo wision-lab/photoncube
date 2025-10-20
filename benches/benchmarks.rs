@@ -8,8 +8,8 @@ use pprof::criterion::{Output, PProfProfiler};
 pub fn benchmark_interpolate_where_mask(c: &mut Criterion) {
     let mut rng = fastrand::Rng::with_seed(0x4d595df4d0f33173);
 
-    let data = Array3::from_shape_fn((255, 255, 1), |(i, j, _k)| i.max(j) as u8);
-    let mask = Array2::from_shape_simple_fn((255, 255), || rng.f32() < 0.01);
+    let data = Array3::from_shape_fn((255, 255, 1), |(i, j, _k)| i.max(j) as u8).into_dyn();
+    let mask = Array2::from_shape_simple_fn((255, 255), || rng.f32() < 0.1);
 
     c.bench_function("interpolate_where_mask", |b| {
         b.iter(|| {

@@ -15,11 +15,11 @@ use imageproc::{
 };
 use ndarray::{
     concatenate, s, Array, Array2, Array3, ArrayBase, ArrayD, ArrayView2, ArrayView3, ArrayViewD,
-    Axis, IxDyn, RawData, Slice,
+    Axis, Data, IxDyn, NewAxis, Slice,
 };
 use ndarray_stats::{interpolate::Linear, QuantileExt};
 use noisy_float::types::n64;
-use numpy::{Ix2, Ix3};
+use numpy::Ix2;
 use pyo3::prelude::*;
 use strum_macros::EnumString;
 
@@ -49,7 +49,7 @@ impl Transform {
 /// Cannot unpack along channel dimension
 pub fn unpack_single<T>(bitplane: &ArrayViewD<'_, u8>, axis: usize) -> Result<ArrayD<T>>
 where
-    T: From<u8> + Copy + num_traits::Zero + Send + Sync + 'static,
+    T: From<u8> + Copy + num_traits::Zero,
 {
     let mut new_dim: Vec<usize> = bitplane.shape().into();
     new_dim[axis] *= 8;
@@ -87,7 +87,10 @@ pub fn pack_single(bitplane: &ArrayViewD<'_, u8>, axis: usize) -> Result<ArrayD<
         let bit = slice.mapv(|v| (v & 1) << ishift);
         let h = slice.len_of(Axis(0));
         let w = slice.len_of(Axis(1));
-        packed_bitplane.slice_mut(s![..h, ..w]).bitor_assign(&bit);
+        packed_bitplane
+            .slice_axis_mut(Axis(0), Slice::from(..h))
+            .slice_axis_mut(Axis(1), Slice::from(..w))
+            .bitor_assign(&bit);
     }
 
     Ok(packed_bitplane)
@@ -209,36 +212,44 @@ where
     frame
 }
 
-pub fn linearrgb_to_srgb(frame: &ArrayViewD<f32>) -> ArrayD<f32> {
-    // https://github.com/blender/blender/blob/master/source/blender/blenlib/intern/math_color.c
+/// Convert from linear colorspace to sRGB one.
+/// Note: This is only well behaved for images in the `[0, 1]` range, so while it is
+///     generic over T, this should be f32 or similar. This will not work over ints.
+///
+/// See: https://github.com/blender/blender/blob/master/source/blender/blenlib/intern/math_color.c
+pub fn linearrgb_to_srgb<T>(frame: &ArrayViewD<T>) -> ArrayD<T>
+where
+    T: Into<f32> + Clamp<f32> + Copy,
+{
     frame.mapv(|x| {
+        let x = T::into(x);
         if x < 0.0031308 {
             if x < 0.0 {
-                return 0.0;
+                return T::clamp(0.0);
             } else {
-                return x * 12.92;
+                return T::clamp(x * 12.92);
             }
         }
-        1.055 * x.powf(1.0 / 2.4) - 0.055
+        T::clamp(1.055 * x.powf(1.0 / 2.4) - 0.055)
     })
 }
 
-pub fn binary_avg_to_rgb(
-    frame: &ArrayViewD<f32>,
-    factor: f32,
-    quantile: Option<f32>,
-) -> ArrayD<f32> {
-    // Invert the process by which binary frames are simulated. The result can be either
-    // linear RGB values or sRGB values depending on how the binary frames were constructed.
-    // Assuming each binary patch was created by a Bernoulli process with p=1-exp(-factor*rgb),
-    // then the average of binary frames tends to p. We can therefore recover the original rgb
-    // values as -log(1-bin)/factor.
-
-    let mut frame = frame.mapv(|v| -(1.0 - v).clamp(1e-6, 1.0).ln() / factor);
+/// Invert the process by which binary frames are simulated. The result can be either
+/// linear RGB values or sRGB values depending on how the binary frames were constructed.
+/// Assuming each binary patch was created by a Bernoulli process with `p=1-exp(-factor*rgb)`,
+/// then the average of binary frames tends to `p`. We can therefore recover the original rgb
+/// values as `-log(1-bin)/factor`.
+///
+/// Note: Again, we are generic over `T` but this should be a floating type.
+pub fn binary_avg_to_rgb<T>(frame: &ArrayViewD<T>, factor: f32, quantile: Option<f64>) -> ArrayD<T>
+where
+    T: Into<f32> + Clamp<f32> + Copy,
+{
+    let mut frame = frame.mapv(|v| -(1.0 - T::into(v)).clamp(1e-6, 1.0).ln() / factor);
 
     if let Some(quantile_val) = quantile {
         let val = Array::from_iter(frame.iter().cloned())
-            .quantile_axis_skipnan_mut(Axis(0), n64(quantile_val as f64), &Linear)
+            .quantile_axis_skipnan_mut(Axis(0), n64(quantile_val), &Linear)
             .unwrap()
             .mean()
             .unwrap();
@@ -248,7 +259,7 @@ pub fn binary_avg_to_rgb(
         frame.par_mapv_inplace(|v| v.clamp(0.0, 1.0));
     };
 
-    frame
+    frame.mapv(|v| T::clamp(v))
 }
 
 // Note: This does not yet support full array, only TOP half.
@@ -300,31 +311,44 @@ where
 
 // Note: The use of generics here is heavy handed, we only really want this function
 //       to work with T=u8 or maybe T=f32/i32. Is there a better way? I.e generic over primitives?
-// Supports HWC
+// Supports dynamically sized arrays of 2 or 3 dims as long as the first two dimensions are HW
 pub fn interpolate_where_mask<S1, S2, T>(
-    frame: &ArrayBase<S1, Ix3>,
+    frame: &ArrayBase<S1, IxDyn>,
     mask: &ArrayBase<S2, Ix2>,
     dither: bool,
-) -> Result<Array3<T>>
+) -> Result<ArrayD<T>>
 where
-    S1: RawData<Elem = T> + ndarray::Data,
-    S2: RawData<Elem = bool> + ndarray::Data,
-    T: Into<f32> + Clamp<f32> + Copy + 'static,
+    S1: Data<Elem = T>,
+    S2: Data<Elem = bool>,
+    T: Into<f32> + Clamp<f32> + Copy,
 {
-    let (h, w, c) = frame.dim();
+    let (frame, needs_squeeze) = if frame.ndim() == 2 {
+        (
+            frame.slice(s![.., .., NewAxis]).into_dimensionality()?,
+            true,
+        )
+    } else if frame.ndim() == 3 {
+        (frame.view().into_dimensionality()?, false)
+    } else {
+        return Err(anyhow!(
+            "Expected frame to be Hw or HWC but got {} dimensions.",
+            frame.ndim()
+        ));
+    };
+
+    let (h, w, _c) = frame.dim();
     let (mask_h, mask_w) = mask.dim();
 
     if (mask_h < h) || (mask_w < w) {
         return Err(anyhow!(
-            "Frame has size {:?} but interpolation mask has size {:?}",
+            "Frame has size {:?} but interpolation mask has size {:?}.",
             frame.dim(),
             mask.dim()
         ));
     }
 
-    // Note: We iterate over CWH and reverse axes to HWC instead of directly creating
-    //       a HWC array as this greatly improved cache locality and has a ~5x speedup!
-    Ok(Array3::from_shape_fn((c, w, h), |(k, j, i)| {
+    let mut output = frame.to_owned();
+    output.indexed_iter_mut().for_each(|((i, j, k), out_val)| {
         if mask[(i, j)] {
             let mut counter: f32 = 0.0;
             let mut value: f32 = 0.0;
@@ -348,12 +372,16 @@ where
                 value / counter
             };
 
-            T::clamp(value)
-        } else {
-            frame[(i, j, k)]
+            *out_val = T::clamp(value);
         }
-    })
-    .reversed_axes())
+    });
+
+    let output = if needs_squeeze {
+        output.into_dyn().squeeze()
+    } else {
+        output.into_dyn()
+    };
+    Ok(output)
 }
 
 // ------------------------------------------------------------------------------
