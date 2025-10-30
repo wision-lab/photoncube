@@ -114,18 +114,26 @@ The python API mirrors the rust and CLI functionality, for more info on how to u
 ```python
 from photoncube import PhotonCube, Transform
 
+# Convert a directory of bin files to a numpy file.
+# This supports the SPAD512 format, and the SwissSPAD 
+# formats (both half array mode and full array mode).
 PhotonCube.convert_to_npy(
     # Directory containing `.bin` files
     "full-array/binary/16kHz/", 
     "test.npy", 
     is_full_array=True, 
+    is_spad512=False,
     message="Converting..."
 )
 
 # Open cube 
+# This does not load the whole cube into memory, 
+# instead it memory maps it allowing you to open 
+# very large photoncubes!
 pc = PhotonCube.open("test.npy")
 
 # Get a frame
+# This will fetch a frame from the memmapped NPY file and unpack it 
 # Note: Only simple integer indexing is allowed!
 frame = pc[10]
 
