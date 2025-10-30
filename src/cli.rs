@@ -40,6 +40,11 @@ pub struct ConvertArgs {
     /// If enabled, assume data is 512x512
     #[arg(long, action)]
     pub full_array: bool,
+
+    /// If enabled, assume data comes from Pi Imaging's SPAD512.
+    /// This will overwrite the `full_array` argument.
+    #[arg(long, action)]
+    pub spad512: bool,
 }
 
 // Ensures that at least one of these two is set.
@@ -253,6 +258,7 @@ pub fn cli_entrypoint(py: Python) -> Result<()> {
             &args.input,
             &args.output,
             args.full_array,
+            args.spad512,
             Some("Converting..."),
         )?),
         Commands::Preview(args) => preview(args),

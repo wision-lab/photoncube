@@ -33,6 +33,7 @@ class PhotonCube:
         src: str | PathLike,
         dst: str | PathLike,
         is_full_array: bool = False,
+        is_spad512: bool = False,
         message: str | None = None,
     ) -> None: ...
     def process_cube(

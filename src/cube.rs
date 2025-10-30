@@ -191,6 +191,7 @@ impl PhotonCube {
         src: P,
         dst: P,
         is_full_array: bool,
+        is_spad512: bool,
         message: Option<&str>,
     ) -> Result<()> {
         let path = src.as_ref();
@@ -209,9 +210,15 @@ impl PhotonCube {
 
             // Create a (sparse if supported) file of zeroed data.
             // Estimate shape of final array, one bin file is 512 raw
-            // half-frames, or 256 full array frames
-            let batch_size = if is_full_array { 256 } else { 512 };
-            let (h, w) = if is_full_array {
+            // half-frames, or 256 full array frames, or 1000 spad512 frames
+            let batch_size = if is_spad512 {
+                1000
+            } else if is_full_array {
+                256
+            } else {
+                512
+            };
+            let (h, w) = if is_full_array || is_spad512 {
                 (512, 512 / 8)
             } else {
                 (256, 512 / 8)
@@ -246,12 +253,16 @@ impl PhotonCube {
                     let mut f = File::open(p)?;
                     f.read_to_end(&mut buffer)?;
 
-                    if is_full_array {
+                    if is_spad512 {
+                        // PI Imaging's SPAD512 stores it's bin files as (1000, 512, 512/8) with the bits in the correct order
+                        chunk.assign(&Array::from_iter(buffer).to_shape((batch_size, h, w))?);
+                    } else if is_full_array {
                         // Raw data is saved as 1/4th of the top array (h, w/4) then a quarter of the
                         // bottom array, but flipped up/down, and repeat. We read out all data in a
                         // buffer that's (h/2, w*2), meaning there's 8 interleaved zones:
                         // Top (1/4), Flipped Btm (1/4), Top (2/4), Flipped Btm (2/4), etc...
                         let flat_data = Array::from_iter(buffer.iter().map(|v| v.reverse_bits()));
+                        println!("{:?}, {:?}", flat_data.shape(), (batch_size, h / 2, w * 2));
                         let data = flat_data.to_shape((batch_size, h / 2, w * 2))?.into_owned();
 
                         // Iterate over array quarters and assign as needed.
@@ -272,6 +283,7 @@ impl PhotonCube {
                             btm_dst.assign(&btm_src);
                         });
                     } else {
+                        // Half array SwissSPAD is (512, 256, 512 / 8) with wrong endianness
                         chunk.assign(
                             &Array::from_iter(buffer.iter().map(|v| v.reverse_bits()))
                                 .to_shape((batch_size, h, w))?,
@@ -635,17 +647,18 @@ impl PhotonCube {
     #[staticmethod]
     #[pyo3(
         name = "convert_to_npy",
-        signature = (src, dst, is_full_array=false, message=None)
+        signature = (src, dst, is_full_array=false, is_spad512=false, message=None)
     )]
     pub fn convert_to_npy_py(
         py: Python,
         src: PathBuf,
         dst: PathBuf,
         is_full_array: bool,
+        is_spad512: bool,
         message: Option<&str>,
     ) -> Result<()> {
         let _defer = DeferredSignal::new(py, "SIGINT")?;
-        Self::convert_to_npy(src, dst, is_full_array, message)
+        Self::convert_to_npy(src, dst, is_full_array, is_spad512, message)
     }
 
     /// Apply corrections such as inpainting, rotating/flipping and any fixes directly
